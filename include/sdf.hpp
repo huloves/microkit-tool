@@ -106,7 +106,7 @@ public:
 				break;
 			default:
 				throw std::invalid_argument("Invalid permission character");
-            }
+			}
         }
 
         return perms;
@@ -136,9 +136,9 @@ public:
 	IrqTrigger getTrigger() const { return trigger; }
 
 	// Setter 方法（如果需要）
-    void setIrq(uint64_t newIrq) { irq = newIrq; }
-    void setId(uint64_t newId) { id = newId; }
-    void setTrigger(IrqTrigger newTrigger) { trigger = newTrigger; }
+	void setIrq(uint64_t newIrq) { irq = newIrq; }
+	void setId(uint64_t newId) { id = newId; }
+	void setTrigger(IrqTrigger newTrigger) { trigger = newTrigger; }
 };
 
 // 定义表示虚拟地址变体的结构
@@ -175,10 +175,10 @@ public:
 // 定义 ChannelEnd 结构体
 class ChannelEnd {
 public:
-    std::size_t pd;
-    uint64_t id;
-    bool notify;
-    bool pp;
+	std::size_t pd;
+	uint64_t id;
+	bool notify;
+	bool pp;
 };
 
 class Channel {
@@ -287,9 +287,9 @@ public:
 
 		std::stringstream error_message;
 		error_message << "Error: " << err
-					<< " on element '" << (node->Value() ? node->Value() : "")
-					<< "': " << filename
-					<< ":" << row << ":" << col;
+				<< " on element '" << (node->Value() ? node->Value() : "")
+				<< "': " << filename
+				<< ":" << row << ":" << col;
 
 		return error_message.str();
 	}
@@ -351,20 +351,20 @@ public:
 		: name(name), size(size), page_size(page_size), page_count(page_count), phys_addr(phys_addr), element(element) {}
 	
 	// Getters
-    std::string getName() const { return name; }
-    uint64_t getSize() const { return size; }
-    PageSize getPageSize() const { return page_size; }
-    uint64_t getPageCount() const { return page_count; }
-    std::optional<uint64_t> getPhysAddr() const { return phys_addr; }
-    const tinyxml2::XMLElement *getXMLElement() const { return element; }
+	std::string getName() const { return name; }
+	uint64_t getSize() const { return size; }
+	PageSize getPageSize() const { return page_size; }
+	uint64_t getPageCount() const { return page_count; }
+	std::optional<uint64_t> getPhysAddr() const { return phys_addr; }
+	const tinyxml2::XMLElement *getXMLElement() const { return element; }
 
-    // Setters
-    void setName(const std::string& newName) { name = newName; }
-    void setSize(uint64_t newSize) { size = newSize; }
-    void setPageSize(PageSize newPageSize) { page_size = newPageSize; }
-    void setPageCount(uint64_t newPageCount) { page_count = newPageCount; }
-    void setPhysAddr(const std::optional<uint64_t>& newPhysAddr) { phys_addr = newPhysAddr; }
-    void setTextPos(tinyxml2::XMLElement * newTextPos) { element = newTextPos; }
+	// Setters
+	void setName(const std::string& newName) { name = newName; }
+	void setSize(uint64_t newSize) { size = newSize; }
+	void setPageSize(PageSize newPageSize) { page_size = newPageSize; }
+	void setPageCount(uint64_t newPageCount) { page_count = newPageCount; }
+	void setPhysAddr(const std::optional<uint64_t>& newPhysAddr) { phys_addr = newPhysAddr; }
+	void setTextPos(tinyxml2::XMLElement * newTextPos) { element = newTextPos; }
 	
 	static PageSize from_uint64_to_pagesize(uint64_t value) {
 		switch (value) {
@@ -387,31 +387,46 @@ public:
 			const tinyxml2::XMLElement *node) {
 		xml_sdf.check_attributes(node, {"name", "size", "page_size", "phys_addr"});
 
-		std::string name = xml_sdf.checked_lookup(node, "name");
+		std::string name;
+		try {
+			name = xml_sdf.checked_lookup(node, "name");
+		} catch (std::exception &e) {
+			std::string err_str = xml_sdf.value_error(node, e.what());
+			throw std::runtime_error(err_str);
+		}
 
 		uint64_t size;
 		auto parsed_size_result = sdf_parse_number(xml_sdf.checked_lookup(node, "size"), node);
 		if (parsed_size_result.second.empty()) {
 			size = parsed_size_result.first;
 		} else {
-			// Default to the minimum page size
-			size = config.page_sizes()[0];
+			std::string err_str = xml_sdf.value_error(node, parsed_size_result.second);
+			throw std::runtime_error(err_str);
 		}
 
 		uint64_t page_size;
-		auto parsed_page_size_result = sdf_parse_number(xml_sdf.checked_lookup(node, "page_size"), node);
-		if (!parsed_page_size_result.second.empty()) {
-			throw std::runtime_error("Parse error: " + parsed_page_size_result.second);
+		std::string xml_page_size;
+		try {
+			xml_page_size = xml_sdf.checked_lookup(node, "page_size");
+			auto parsed_page_size_result = sdf_parse_number(xml_sdf.checked_lookup(node, "page_size"), node);
+			if (!parsed_page_size_result.second.empty()) {
+				std::string err_str = xml_sdf.value_error(node, std::string("Parse error: ") + parsed_page_size_result.second);
+				throw std::runtime_error(err_str);
+			}
+			page_size = parsed_page_size_result.first;
+		} catch (std::exception &e) {
+			page_size = config.page_sizes()[0];
 		}
-		page_size = parsed_page_size_result.first;
 
 		bool page_size_valid = std::find(config.page_sizes().begin(), config.page_sizes().end(), page_size) != config.page_sizes().end();
 		if (!page_size_valid) {
-			throw std::runtime_error("page size 0x" + std::to_string(page_size) + " not supported");
+			std::string err_str = xml_sdf.value_error(node, std::string("page size 0x") + std::to_string(page_size) + " not supported");
+			throw std::runtime_error(err_str);
 		}
 
 		if (size % page_size != 0) {
-			throw std::runtime_error("size is not a multiple of the page size");
+			std::string err_str = xml_sdf.value_error(node, std::string("size is not a multiple of the page size"));
+			throw std::runtime_error(err_str);
 		}
 
 		std::optional<uint64_t> phys_addr;
@@ -435,16 +450,16 @@ public:
 
 class SysMap {
 public:
-    std::string mr;					// 内存区域标识符
-    uint64_t vaddr;					// 虚拟地址
-    uint8_t perms;					// 权限，以 8 位整数编码
-    bool cached;					// 缓存标志
-    tinyxml2::XMLElement *element;	// XML文档中的可选位置
+	std::string mr;					// 内存区域标识符
+	uint64_t vaddr;					// 虚拟地址
+	uint8_t perms;					// 权限，以 8 位整数编码
+	bool cached;					// 缓存标志
+	tinyxml2::XMLElement *element;	// XML文档中的可选位置
 
 public:
-    SysMap(const std::string &mr, uint64_t vaddr, uint8_t perms, bool cached,
-           tinyxml2::XMLElement* text_pos = nullptr)
-        : mr(mr), vaddr(vaddr), perms(perms), cached(cached), element(text_pos) {}
+	SysMap(const std::string &mr, uint64_t vaddr, uint8_t perms, bool cached,
+		tinyxml2::XMLElement* text_pos = nullptr)
+		: mr(mr), vaddr(vaddr), perms(perms), cached(cached), element(text_pos) {}
 
 	void print() const {
 		std::cout << "SysMap: MR=" << mr
@@ -529,10 +544,10 @@ public:
 	// For debugging purposes
 	void printDetails() const {
 		std::cout << "VirtualMachine: " << name << "\n"
-					<< "Priority: " << static_cast<int>(priority) << "\n"
-					<< "Budget: " << budget << "\n"
-					<< "Period: " << period << "\n"
-					<< "Number of VCPUs: " << vcpus.size() << std::endl;
+			<< "Priority: " << static_cast<int>(priority) << "\n"
+			<< "Budget: " << budget << "\n"
+			<< "Period: " << period << "\n"
+			<< "Number of VCPUs: " << vcpus.size() << std::endl;
 		for (const auto& cpu : vcpus) {
 			std::cout << cpu << std::endl;
 		}
@@ -542,22 +557,22 @@ public:
 class ProtectionDomain {
 private:
 	std::optional<uint64_t> id;
-    std::string name;
-    uint8_t priority;
-    uint64_t budget;
-    uint64_t period;
-    bool passive;
-    uint64_t stack_size;
-    bool smc;  // Secure Memory Call or similar
-    std::filesystem::path program_image;
-    std::vector<SysMap> maps;
-    std::vector<SysIrq> irqs;
-    std::vector<SysSetVar> setvars;
-    std::optional<VirtualMachine> virtual_machine;  // Assuming VM instances are managed via smart pointers
-    std::vector<ProtectionDomain> child_pds;
-    bool has_children;
-    std::optional<size_t> parent;
-    const tinyxml2::XMLElement *text_pos;
+	std::string name;
+	uint8_t priority;
+	uint64_t budget;
+	uint64_t period;
+	bool passive;
+	uint64_t stack_size;
+	bool smc;  // Secure Memory Call or similar
+	std::filesystem::path program_image;
+	std::vector<SysMap> maps;
+	std::vector<SysIrq> irqs;
+	std::vector<SysSetVar> setvars;
+	std::optional<VirtualMachine> virtual_machine;  // Assuming VM instances are managed via smart pointers
+	std::vector<ProtectionDomain> child_pds;
+	bool has_children;
+	std::optional<size_t> parent;
+	const tinyxml2::XMLElement *text_pos;
 
 public:
 	ProtectionDomain(
@@ -595,11 +610,14 @@ public:
 			has_children(has_children),
 			parent(parent),
 			text_pos(text_pos) { }
+	
+	const std::optional<size_t> get_parent(void) { return parent; }
+	void set_parent(size_t idx) { parent = idx; }
 
 	static ProtectionDomain from_xml(const Config &config,
-									const XmlSystemDescription &xml_sdf,
-									const tinyxml2::XMLElement *element,
-									bool is_child) {
+					const XmlSystemDescription &xml_sdf,
+					const tinyxml2::XMLElement *element,
+					bool is_child) {
 		std::vector<std::string> attrs = {
 			"name", "priority", "budget", "period", "passive", "stack_size", "smc"
 		};
@@ -661,8 +679,8 @@ public:
 
 		if (budget > period) {
 			std::string error_message = "budget (" + std::to_string(budget) + 
-										") must be less than, or equal to, period (" 
-										+ std::to_string(period) + ")";
+						") must be less than, or equal to, period (" 
+						+ std::to_string(period) + ")";
 			throw std::runtime_error(error_message);
 		}
 
@@ -691,7 +709,7 @@ public:
 			stack_size = PD_DEFAULT_STACK_SIZE;
 		}
 
-		bool smc;
+		bool smc = false;
 		const char *xml_smc = element->Attribute("smc");
 		if (xml_smc != nullptr) {
 			bool value;
@@ -706,10 +724,12 @@ public:
 			if (config.arm_smc.has_value()) {
 				bool smc_allowed = config.arm_smc.value();  // Get the value from optional if it exists
 				if (!smc_allowed) {
-					throw std::runtime_error("Using SMC support without ARM SMC forwarding support enabled for this platform");
+					std::string err_str = xml_sdf.value_error(element, std::string("Using SMC support without ARM SMC forwarding support enabled for this platform"));
+					throw std::runtime_error(err_str);
 				}
 			} else {
-				throw std::runtime_error("ARM SMC forwarding support is not available for this architecture");
+				std::string err_str = xml_sdf.value_error(element, std::string("ARM SMC forwarding support is not available for this architecture"));
+				throw std::runtime_error(err_str);
 			}
 		}
 
@@ -863,6 +883,51 @@ public:
 				std::nullopt,
 				element);
 	}
+
+	static std::vector<ProtectionDomain> pd_tree_to_list(const XmlSystemDescription &xml_sdf, const ProtectionDomain &pd, size_t idx) {
+		std::vector<uint64_t> child_ids;
+		for (auto child_pd : pd.child_pds) {
+			uint64_t child_id = child_pd.id.value();
+			if (std::find(child_ids.begin(), child_ids.end(), child_id) != child_ids.end()) {
+				std::string err_str = xml_sdf.value_error(child_pd.text_pos, "Error: duplicate id");
+				throw std::runtime_error(err_str);
+			}
+			VirtualMachine vm = pd.virtual_machine.value();
+			for (auto vcpu : vm.vcpus) {
+				if (child_id == vcpu.id) {
+					std::string err_str = xml_sdf.value_error(child_pd.text_pos, std::string("Error: duplicate id: ") + std::to_string(child_id) + "clashes with virtual machine vcpu id");
+				}
+			}
+			child_ids.push_back(child_id);
+		}
+
+		std::vector<ProtectionDomain> new_child_pds;
+		std::vector<ProtectionDomain> child_pds = pd.child_pds;
+		for (auto child_pd : child_pds) {
+			child_pd.set_parent(idx);
+			std::vector<ProtectionDomain> temp_pd;
+			temp_pd = ProtectionDomain::pd_tree_to_list(xml_sdf, child_pd, child_pds.size());
+			new_child_pds.insert(new_child_pds.end(), temp_pd.begin(), temp_pd.end());
+		}
+
+		std::vector<ProtectionDomain> all = { pd };
+		all.insert(all.end(), new_child_pds.begin(), new_child_pds.end());
+
+		return all;
+	}
+
+	static std::vector<ProtectionDomain> pd_flatten(const XmlSystemDescription &xml_sdf, const std::vector<ProtectionDomain> &pds) {
+		std::vector<ProtectionDomain> all_pds;
+
+		for (auto pd : pds) {
+			assert(pd.get_parent() == std::nullopt);
+			std::vector<ProtectionDomain> temp_pd;
+			temp_pd = ProtectionDomain::pd_tree_to_list(xml_sdf, pd, pds.size());
+			all_pds.insert(all_pds.end(), temp_pd.begin(), temp_pd.end());
+		}
+
+		return all_pds;
+	}
 };
 
 class SystemDescription {
@@ -870,68 +935,71 @@ public:
 	std::vector<ProtectionDomain> protection_domains;
 	std::vector<SysMemoryRegion> mem_regions;
 	std::vector<Channel> channels;
-};
 
-SystemDescription parse(std::string &filename, std::string &xml, Config &config) {
-	tinyxml2::XMLDocument *doc = new tinyxml2::XMLDocument;
-	tinyxml2::XMLError result = doc->Parse(xml.c_str());
+	static SystemDescription parse(std::string &filename, std::string &xml, Config &config) {
+		tinyxml2::XMLDocument *doc = new tinyxml2::XMLDocument;
+		tinyxml2::XMLError result = doc->Parse(xml.c_str());
 
-	if (result != tinyxml2::XML_SUCCESS) {
-		// If parsing failed, construct and return an error message using the filename
-		std::string error_message = "Could not parse '" + filename + "': " + doc->ErrorName();
-		throw std::runtime_error(error_message);
-	}
-
-	XmlSystemDescription xml_sdf(filename, doc);
-
-	std::vector<ProtectionDomain> root_pds;
-	std::vector<SysMemoryRegion> mrs;
-	std::vector<Channel> channels;
-
-	const tinyxml2::XMLElement *systemNode = xml_sdf.findSystemNode();
-	if (systemNode) {
-		std::cout << "Found 'system' node: " << systemNode->Name() << std::endl;
-	} else {
-		std::cout << "System node not found in the XML document." << std::endl;
-			std::string error_message = "Could not find system node";
+		if (result != tinyxml2::XML_SUCCESS) {
+			// If parsing failed, construct and return an error message using the filename
+			std::string error_message = "Could not parse '" + filename + "': " + doc->ErrorName();
 			throw std::runtime_error(error_message);
-	}
-
-	const tinyxml2::XMLNode *root = doc->RootElement();
-	if (xml_sdf.checkNoText(root)) {
-		std::cout << "No non-whitespace text found in the XML document." << std::endl;
-	} else {
-		std::cerr << "There is non-whitespace text in the XML document." << std::endl;
-	}
-
-	// Channels cannot be parsed immediately as they refer to a particular protection domain
-    // via an index in the list of PDs. This means that we have to parse all PDs first and
-    // then parse the channels.
-	std::vector<const tinyxml2::XMLElement *> channel_nodes;
-
-	for (const tinyxml2::XMLElement *child = root->FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
-		const char *child_name = child->Name();
-
-		if (strcmp(child_name, "protection_domain") == 0) {
-			try {
-				root_pds.push_back(ProtectionDomain::from_xml(config, xml_sdf, child, false));
-			} catch (std::exception &e) {
-				throw std::runtime_error(std::string("Failed to parse protection domain: ") + e.what());
-			}
-		} else if (strcmp(child_name, "channel") == 0) {
-		    channel_nodes.push_back(child);
-		} else if (strcmp(child_name, "memory_region") == 0) {
-		    try {
-		        // mrs.push_back(SysMemoryRegion::from_xml(child));
-		    } catch (std::exception &e) {
-				throw std::runtime_error(std::string("Failed to parse memory region: ") + e.what());
-		    }
-		} else {
-			throw std::runtime_error(std::string("Invalid XML element '") + child_name + "': " + child->Name());
 		}
-	}
 
-	return { root_pds, mrs, channels };
-}
+		XmlSystemDescription xml_sdf(filename, doc);
+
+		std::vector<ProtectionDomain> root_pds;
+		std::vector<SysMemoryRegion> mrs;
+		std::vector<Channel> channels;
+
+		const tinyxml2::XMLElement *systemNode = xml_sdf.findSystemNode();
+		if (systemNode) {
+			std::cout << "Found 'system' node: " << systemNode->Name() << std::endl;
+		} else {
+			std::cout << "System node not found in the XML document." << std::endl;
+				std::string error_message = "Could not find system node";
+				throw std::runtime_error(error_message);
+		}
+
+		const tinyxml2::XMLNode *root = doc->RootElement();
+		if (xml_sdf.checkNoText(root)) {
+			std::cout << "No non-whitespace text found in the XML document." << std::endl;
+		} else {
+			std::cerr << "There is non-whitespace text in the XML document." << std::endl;
+		}
+
+		// Channels cannot be parsed immediately as they refer to a particular protection domain
+		// via an index in the list of PDs. This means that we have to parse all PDs first and
+		// then parse the channels.
+		std::vector<const tinyxml2::XMLElement *> channel_nodes;
+
+		for (const tinyxml2::XMLElement *child = root->FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
+			const char *child_name = child->Name();
+
+			if (strcmp(child_name, "protection_domain") == 0) {
+				try {
+					root_pds.push_back(ProtectionDomain::from_xml(config, xml_sdf, child, false));
+				} catch (std::exception &e) {
+					throw std::runtime_error(std::string("Failed to parse protection domain: ") + e.what());
+				}
+			} else if (strcmp(child_name, "channel") == 0) {
+				channel_nodes.push_back(child);
+			} else if (strcmp(child_name, "memory_region") == 0) {
+				try {
+					mrs.push_back(SysMemoryRegion::from_xml(config, xml_sdf, child));
+				} catch (std::exception &e) {
+					throw std::runtime_error(std::string("Failed to parse memory region: ") + e.what());
+				}
+			} else {
+				std::string err_str = xml_sdf.value_error(child, std::string("Invalid XML element '") + child_name + "': " + child->Name());
+				throw std::runtime_error(err_str);
+			}
+		}
+
+		std::vector<ProtectionDomain> pds = ProtectionDomain::pd_flatten(xml_sdf, root_pds);
+
+		return { root_pds, mrs, channels };
+	}
+};
 
 #endif /* SDF_HPP */

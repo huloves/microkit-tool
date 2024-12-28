@@ -430,13 +430,13 @@ int main(int argc, char *argv[])
 		}
 
         if (armPaSizeBits) {
-            std::cout << "Physical address bits: " << *armPaSizeBits << std::endl;
-        } else {
-            std::cout << "No specific physical address bits required." << std::endl;
-        }
-    } catch (const std::runtime_error& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-    }
+		std::cout << "Physical address bits: " << *armPaSizeBits << std::endl;
+		} else {
+		std::cout << "No specific physical address bits required." << std::endl;
+		}
+	} catch (const std::runtime_error& e) {
+		std::cerr << "Error: " << e.what() << std::endl;
+	}
 
 	std::optional<bool> arm_smc;
 	switch (arch) {
@@ -508,7 +508,7 @@ int main(int argc, char *argv[])
 		std::exit(1);
 	}
 
-	SystemDescription systemDescription = parse(args.system, system_xml, kernel_config);
+	SystemDescription systemDescription = SystemDescription::parse(args.system, system_xml, kernel_config);
 
 	return 0;
 }
