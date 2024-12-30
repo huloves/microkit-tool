@@ -172,21 +172,6 @@ public:
 	SysSetVarKind kind;
 };
 
-// 定义 ChannelEnd 结构体
-class ChannelEnd {
-public:
-	std::size_t pd;
-	uint64_t id;
-	bool notify;
-	bool pp;
-};
-
-class Channel {
-public:
-	ChannelEnd end_a;
-	ChannelEnd end_b;
-};
-
 class VirtualCpu {
 public:
 	uint64_t id;
@@ -614,6 +599,13 @@ public:
 	const std::optional<size_t> get_parent(void) { return parent; }
 	void set_parent(size_t idx) { parent = idx; }
 
+	const std::string get_name(void) { return name; }
+	void set_name(std::string new_name) { name = new_name; };
+
+	const std::optional<uint64_t> get_id(void) { return id; }
+
+	const std::filesystem::path get_program_image(void) { return program_image; }
+
 	static ProtectionDomain from_xml(const Config &config,
 					const XmlSystemDescription &xml_sdf,
 					const tinyxml2::XMLElement *element,
@@ -930,6 +922,137 @@ public:
 	}
 };
 
+// 定义 ChannelEnd 结构体
+class ChannelEnd {
+private:
+	std::size_t pd;
+	uint64_t id;
+	bool notify;
+	bool pp;
+
+public:
+	// 默认构造函数
+	ChannelEnd(void) : pd(0), id(0), notify(false), pp(false) { }
+
+	// ChannelEnd构造函数
+	ChannelEnd(std::size_t pd, uint64_t id, bool notify, bool pp)
+		: pd(pd), id(id), notify(notify), pp(pp) { }
+	
+	const bool get_pp(void) { return pp; }
+	
+	static ChannelEnd from_xml(XmlSystemDescription &xml_sdf, const tinyxml2::XMLElement *node, std::vector<ProtectionDomain> &pds) {
+		std::string node_name = std::string(node->Name());
+		if (node_name != "end") {
+			std::string err_str = xml_sdf.value_error(node, "Error: invalid XML element");
+			throw std::runtime_error(err_str);
+		}
+
+		xml_sdf.check_attributes(node, {"pd", "id", "pp", "notify"});
+		std::string end_pd = xml_sdf.checked_lookup(node, "pd");
+		int64_t end_id = std::atoi(xml_sdf.checked_lookup(node, "id").c_str());
+
+		if (end_id > static_cast<int64_t>(PD_MAX_ID)) {
+			std::string err_str = xml_sdf.value_error(node, std::string("id must be < ") + std::to_string(PD_MAX_ID + 1));
+			throw std::runtime_error(err_str);
+		}
+
+		if (end_id < 0) {
+			std::string err_str = xml_sdf.value_error(node, std::string("id must be >= 0"));
+			throw std::runtime_error(err_str);
+		}
+
+		bool notify;
+		const char *xml_notify = node->Attribute("notify");
+		if (xml_notify != nullptr) {  // If attribute exists
+			bool value;
+			if (str_to_bool(xml_notify, value)) {
+				notify = value;
+			} else {
+				std::string err_str = xml_sdf.value_error(node, std::string("notify must be 'true' or 'false'"));
+				throw std::runtime_error(err_str);
+			}
+		} else {
+			// Default to notify
+			notify = true;
+		}
+
+		bool pp;
+		const char *xml_pp = node->Attribute("pp");
+		if (xml_pp != nullptr) {  // If attribute exists
+			bool value;
+			if (str_to_bool(xml_pp, value)) {
+				pp = value;
+			} else {
+				std::string err_str = xml_sdf.value_error(node, std::string("pp must be 'true' or 'false'"));
+				throw std::runtime_error(err_str);
+			}
+		} else {
+			// Default to pp
+			pp = false;
+		}
+
+		size_t pd_idx;
+		auto it = std::find_if(pds.begin(), pds.end(), [end_pd](ProtectionDomain pd) {
+					return pd.get_name() == end_pd;
+				});
+		if (it != pds.end()) {
+			pd_idx = std::distance(pds.begin(), it);
+		} else {
+			std::string err_str = xml_sdf.value_error(node, std::string("invalid PD name '") + end_pd + "'");
+			throw std::runtime_error(err_str);
+		}
+
+		return ChannelEnd(pd_idx, end_id, notify, pp);
+	}
+};
+
+class Channel {
+private:
+	ChannelEnd end_a;
+	ChannelEnd end_b;
+
+public:
+	// Channel构造函数
+	Channel(ChannelEnd new_end_a, ChannelEnd new_end_b) : end_a(new_end_a), end_b(new_end_b) { }
+
+	Channel(std::size_t pd_a, uint64_t id_a, bool notify_a, bool pp_a,
+		std::size_t pd_b, uint64_t id_b, bool notify_b, bool pp_b)
+		: end_a(pd_a, id_a, notify_a, pp_a), end_b(pd_b, id_b, notify_b, pp_b) { }
+	
+	static std::pair<ChannelEnd, ChannelEnd> parse_channel_ends(XmlSystemDescription &xml_sdf, const tinyxml2::XMLElement *node, std::vector<ProtectionDomain> &pds) {
+		std::vector<ChannelEnd> ends;
+		const tinyxml2::XMLElement *child = node->FirstChildElement();
+
+		while (child != nullptr) {
+			if (child->ToElement()) {  // 确保它是一个元素节点
+				ChannelEnd end = ChannelEnd::from_xml(xml_sdf, child, pds);
+				ends.push_back(end);
+			}
+			child = child->NextSiblingElement();  // 移动到下一个兄弟节点
+		}
+
+		if (ends.size() != 2) {
+			std::string err_str = xml_sdf.value_error(node, std::string("exactly two end elements must be specified"));
+			throw std::runtime_error(err_str);
+		}
+
+		return {ends[0], ends[1]};
+	}
+
+	static Channel from_xml(XmlSystemDescription &xml_sdf, const tinyxml2::XMLElement *node, std::vector<ProtectionDomain> &pds) {
+		xml_sdf.check_attributes(node, {});
+
+		auto [end_a, end_b] = parse_channel_ends(xml_sdf, node, pds);
+
+		if (end_a.get_pp() && end_b.get_pp()) {
+			std::string err_str = xml_sdf.value_error(node, std::string("cannot ppc bidirectionally"));
+			throw std::runtime_error(err_str);
+		}
+
+		return Channel(end_a, end_b);
+	}
+};
+
 class SystemDescription {
 public:
 	std::vector<ProtectionDomain> protection_domains;
@@ -997,6 +1120,10 @@ public:
 		}
 
 		std::vector<ProtectionDomain> pds = ProtectionDomain::pd_flatten(xml_sdf, root_pds);
+
+		for (auto node : channel_nodes) {
+			channels.push_back(Channel::from_xml(xml_sdf, node, pds));
+		}
 
 		return { root_pds, mrs, channels };
 	}

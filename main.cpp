@@ -7,11 +7,30 @@
 #include <algorithm>
 #include <optional>
 
-#include <sel4.hpp>
-#include <sdf.hpp>
+#include "sel4.hpp"
+#include "sdf.hpp"
+#include "elf.hpp"
 
 #include "nlohmann/json.hpp"
 #include "tinyxml2.h"
+
+class MonitorConfig {
+private:
+	const std::string untyped_info_symbol_name;
+	const std::string bootstrap_invocation_count_symbol_name;
+	const std::string bootstrap_invocation_data_symbol_name;
+	const std::string system_invocation_count_symbol_name;
+
+public:
+	MonitorConfig(const std::string new_untyped_info_symbol_name,
+		      const std::string new_bootstrap_invocation_count_symbol_name,
+		      const std::string new_bootstrap_invocation_data_symbol_name,
+		      const std::string new_system_invocation_count_symbol_name) :
+			untyped_info_symbol_name(new_untyped_info_symbol_name),
+			bootstrap_invocation_count_symbol_name(new_bootstrap_invocation_count_symbol_name),
+			bootstrap_invocation_data_symbol_name(new_bootstrap_invocation_data_symbol_name),
+			system_invocation_count_symbol_name(new_system_invocation_count_symbol_name) { }
+};
 
 struct Args {
 	std::string system;
@@ -165,6 +184,16 @@ static uint64_t json_str_as_u64(const nlohmann::json &json, const std::string &k
 	}
 
 	return value;
+}
+
+std::optional<std::filesystem::path> get_full_path(const std::filesystem::path &image, const std::vector<std::filesystem::path> &search_paths) {
+	for (const auto &base_path : search_paths) {
+		std::filesystem::path full_path = base_path / image;
+		if (std::filesystem::exists(full_path)) {
+			return full_path;
+		}
+	}
+	return std::nullopt;
 }
 
 int main(int argc, char *argv[])
@@ -508,7 +537,57 @@ int main(int argc, char *argv[])
 		std::exit(1);
 	}
 
-	SystemDescription systemDescription = SystemDescription::parse(args.system, system_xml, kernel_config);
+	SystemDescription system = SystemDescription::parse(args.system, system_xml, kernel_config);
+
+	MonitorConfig monitor_config = MonitorConfig(
+					"untyped_info",
+					"bootstrap_invocation_count",
+					"bootstrap_invocation_data",
+					"system_invocation_count");
+	
+	ElfFile kernel_elf(kernel_elf_path);
+        ElfFile monitor_elf(monitor_elf_path);
+
+	size_t loadable_segments_count = monitor_elf.count_loadable_segments();
+        if (loadable_segments_count > 1) {
+            std::cerr << "Monitor (" << monitor_elf_path << ") has " << loadable_segments_count
+                      << " segments, it must only have one" << std::endl;
+            std::exit(1);
+        }
+	
+	std::vector<std::filesystem::path> search_paths;
+
+	try {
+		// 将当前目录添加到搜索路径
+		search_paths.push_back(std::filesystem::current_path());
+
+		// 将参数中指定的搜索路径添加到搜索路径
+		for (auto search_path : args.search_paths) {
+			search_paths.push_back(std::filesystem::path(search_path));
+		}
+
+		// 打印搜索路径来验证添加成功
+		for (const auto &path : search_paths) {
+			std::cout << "Search Path: " << path << std::endl;
+		}
+	} catch (const std::filesystem::filesystem_error &e) {
+		std::cerr << "Error handling filesystem: " << e.what() << std::endl;
+		std::exit(1);
+	}
+
+	std::vector<ElfFile> pd_elf_files(system.protection_domains.size());
+	for (auto pd : system.protection_domains) {
+		auto optional_path = get_full_path(pd.get_program_image(), search_paths);
+		if (optional_path) {
+			ElfFile elf_file = ElfFile::from_path(*optional_path);
+			pd_elf_files.push_back(elf_file);
+		} else {
+			throw std::runtime_error(std::string("Unable to find program image: ") + pd.get_program_image().string());
+		}
+	}
+
+	uint64_t invocation_table_size = kernel_config.minimum_page_size;
+	uint64_t system_cnode_size = 2;
 
 	return 0;
 }
