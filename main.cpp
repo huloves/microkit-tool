@@ -10,9 +10,204 @@
 #include "sel4.hpp"
 #include "sdf.hpp"
 #include "elf.hpp"
+#include "util.hpp"
 
 #include "nlohmann/json.hpp"
 #include "tinyxml2.h"
+
+constexpr uint64_t INIT_NULL_CAP_ADDRESS       = 0;
+constexpr uint64_t INIT_TCB_CAP_ADDRESS        = 1;
+constexpr uint64_t INIT_CNODE_CAP_ADDRESS      = 2;
+constexpr uint64_t INIT_VSPACE_CAP_ADDRESS     = 3;
+constexpr uint64_t IRQ_CONTROL_CAP_ADDRESS     = 4; // Singleton
+constexpr uint64_t INIT_ASID_POOL_CAP_ADDRESS  = 6;
+constexpr uint64_t SMC_CAP_ADDRESS             = 15;
+
+const uint64_t MAX_SYSTEM_INVOCATION_SIZE = util::mb(128);
+
+struct KernelFrameRiscv64 {
+public:
+    uint64_t paddr;
+    uint64_t pptr;
+    int32_t user_accessible;
+};
+
+struct KernelFrameAarch64 {
+public:
+    uint64_t paddr;
+    uint64_t pptr;
+    int32_t execute_never;
+    int32_t user_accessible;
+} __attribute__((__packed__));
+
+std::vector<uint64_t> kernel_device_addrs(const Config& config, const ElfFile& kernel_elf) {
+	assert(config.word_size == 64); // Ensure 64-bit word size
+
+	std::vector<uint64_t> kernel_devices;
+	std::optional<std::pair<uint64_t, uint64_t>> symbol = kernel_elf.find_symbol("kernel_device_frames");
+	if (!symbol) {
+		throw std::runtime_error("Could not find 'kernel_device_frames' symbol");
+	}
+
+	const std::vector<uint8_t> kernel_frame_bytes = kernel_elf.get_data(symbol->first, symbol->second);
+	if (kernel_frame_bytes.empty()) {
+		throw std::runtime_error("Failed to retrieve kernel device frame data");
+	}
+
+	size_t kernel_frame_size = 0;
+	if (config.arch == Arch::Aarch64) {
+		kernel_frame_size = sizeof(KernelFrameAarch64);
+	} else if (config.arch == Arch::Riscv64) {
+		kernel_frame_size = sizeof(KernelFrameRiscv64);
+	} else {
+		throw std::runtime_error("Unsupported architecture");
+	}
+
+	for (size_t offset = 0; offset + kernel_frame_size <= symbol->second; offset += kernel_frame_size) {
+		uint32_t user_accessible = 0;
+		uint64_t paddr = 0;
+
+		if (config.arch == Arch::Aarch64) {
+			const KernelFrameAarch64* frame = reinterpret_cast<const KernelFrameAarch64*>(kernel_frame_bytes.data() + offset);
+			user_accessible = frame->user_accessible;
+			paddr = frame->paddr;
+		} else if (config.arch == Arch::Riscv64) {
+			const KernelFrameRiscv64* frame = reinterpret_cast<const KernelFrameRiscv64*>(kernel_frame_bytes.data() + offset);
+			user_accessible = frame->user_accessible;
+			paddr = frame->paddr;
+		}
+
+		if (user_accessible == 0) {
+			kernel_devices.push_back(paddr);
+		}
+	}
+
+	return kernel_devices;
+}
+
+struct KernelRegion64 {
+	uint64_t start;
+	uint64_t end;
+};
+
+std::vector<std::pair<uint64_t, uint64_t>> kernel_phys_mem(const Config& kernel_config, const ElfFile& kernel_elf) {
+	assert(kernel_config.word_size == 64 && "Unsupported word-size");
+
+	std::vector<std::pair<uint64_t, uint64_t>> phys_mem;
+	std::optional<std::pair<uint64_t, uint64_t>> symbol_info = kernel_elf.find_symbol("avail_p_regs");
+	if (!symbol_info) {
+		throw std::runtime_error("Could not find 'avail_p_regs' symbol");
+	}
+
+	const std::vector<uint8_t> p_region_bytes = kernel_elf.get_data(symbol_info->first, symbol_info->second);
+	if (p_region_bytes.empty()) {
+		throw std::runtime_error("Could not retrieve data for 'avail_p_regs'");
+	}
+
+	size_t p_region_size = sizeof(KernelRegion64);
+	size_t offset = 0;
+	while (offset < symbol_info->second) {
+		if (offset + p_region_size > p_region_bytes.size()) {
+			throw std::out_of_range("KernelRegion64 data out of range");
+		}
+
+		const KernelRegion64* p_region = reinterpret_cast<const KernelRegion64*>(p_region_bytes.data() + offset);
+		phys_mem.emplace_back(p_region->start, p_region->end);
+		offset += p_region_size;
+	}
+
+	return phys_mem;
+}
+
+MemoryRegion kernel_self_mem(const ElfFile& kernel_elf) {
+	auto segments = kernel_elf.loadable_segments();
+	if (segments.empty()) {
+		throw std::runtime_error("No loadable segments found.");
+	}
+
+	const uint64_t base = segments[0]->get_physical_address();
+	auto ki_end_symbol = kernel_elf.find_symbol("ki_end");
+	if (!ki_end_symbol) {
+		throw std::runtime_error("Could not find 'ki_end' symbol");
+	}
+
+	uint64_t ki_end_v = ki_end_symbol->first;
+	uint64_t ki_end_p = ki_end_v - segments[0]->get_virtual_address() + base;
+
+	return MemoryRegion(base, ki_end_p);
+}
+
+MemoryRegion kernel_boot_mem(ElfFile& kernel_elf) {
+	const auto& segments = kernel_elf.loadable_segments();
+	if (segments.empty()) {
+		throw std::runtime_error("No loadable segments found");
+	}
+	uintptr_t base = segments[0]->get_physical_address();
+
+	auto ki_boot = kernel_elf.find_symbol("ki_boot_end");
+	uintptr_t ki_boot_end_p = ki_boot->first- segments[0]->get_virtual_address() + base;
+
+	return MemoryRegion(base, ki_boot_end_p);
+}
+
+class KernelPartialBootInfo {
+public:
+	DisjointMemoryRegion device_memory;
+	DisjointMemoryRegion normal_memory;
+	MemoryRegion boot_region;
+
+	/// Emulate what happens during a kernel boot, up to the point
+	/// where the reserved region is allocated.
+	///
+	/// This factors the common parts of 'emulate_kernel_boot' and
+	/// 'emulate_kernel_boot_partial' to avoid code duplication.
+	///
+	///
+	/// 模拟内核启动过程，直到分配保留区域为止。
+	///
+	/// 这部分提取了 'emulate_kernel_boot' 和 'emulate_kernel_boot_partial'
+	/// 的公共部分，以避免代码重复。
+	static KernelPartialBootInfo kernel_partial_boot(const Config &kernel_config, ElfFile kernel_elf) {
+		DisjointMemoryRegion device_memory;
+		DisjointMemoryRegion normal_memory;
+
+		// 首先将整个物理地址空间分配为设备内存 paddr_user_device_top = 0x10000000000
+		device_memory.insert_region(0, kernel_config.paddr_user_device_top);
+
+		// Next, remove all the kernel devices.
+		// NOTE: There is an assumption each kernel device is one frame
+		// in size only. It's possible this assumption could break in the
+		// future.
+		// 获取kernel_elf中的每一个设备信息，获得起始地址后移除，目前假设设备大小为一页
+		for (auto paddr : kernel_device_addrs(kernel_config, kernel_elf)) {
+			device_memory.remove_region(paddr, paddr + kernel_config.kernel_frame_size);
+		}
+
+		// Remove all the actual physical memory from the device regions
+		// but add it all to the actual normal memory regions
+		// 获取物理内存区域，从设备内存区域中移除，加入到不同普通内存区域中
+		for (auto p_region : kernel_phys_mem(kernel_config, kernel_elf)) {
+			device_memory.remove_region(p_region.first, p_region.second);
+			normal_memory.insert_region(p_region.first, p_region.second);
+		}
+
+		MemoryRegion self_mem = kernel_self_mem(kernel_elf);
+		normal_memory.remove_region(self_mem.base, self_mem.end);
+
+		MemoryRegion boot_region = kernel_boot_mem(kernel_elf);
+
+		return KernelPartialBootInfo {
+			.device_memory = device_memory,
+			.normal_memory = normal_memory,
+			.boot_region = boot_region,
+		};
+	}
+
+	static std::pair<DisjointMemoryRegion, MemoryRegion> emulate_kernel_boot_partial(const Config &kernel_config, ElfFile kernel_elf) {
+		auto partial_info = kernel_partial_boot(kernel_config, kernel_elf);
+		return {partial_info.normal_memory, partial_info.boot_region};
+	}
+};
 
 class MonitorConfig {
 private:
@@ -30,6 +225,129 @@ public:
 			bootstrap_invocation_count_symbol_name(new_bootstrap_invocation_count_symbol_name),
 			bootstrap_invocation_data_symbol_name(new_bootstrap_invocation_data_symbol_name),
 			system_invocation_count_symbol_name(new_system_invocation_count_symbol_name) { }
+};
+
+class BuiltSystem {
+public:
+	uint64_t number_of_system_caps;
+	std::vector<uint8_t> invocation_data;
+	uint64_t invocation_data_size;
+	std::vector<Invocation> bootstrap_invocations;
+	std::vector<Invocation> system_invocations;
+	BootInfo kernel_boot_info;
+	MemoryRegion reserved_region;
+	uint64_t fault_ep_cap_address;
+	uint64_t reply_cap_address;
+	std::unordered_map<uint64_t, std::string> cap_lookup;
+	std::vector<uint64_t> tcb_caps;
+	std::vector<uint64_t> sched_caps;
+	std::vector<uint64_t> ntfn_caps;
+	std::vector<std::vector<Region>> pd_elf_regions;
+	std::vector<std::vector<uint64_t>> pd_setvar_values;
+	std::vector<Object> kernel_objects;
+	MemoryRegion initial_task_virt_region;
+	MemoryRegion initial_task_phys_region;
+
+	// Default constructor with initializations
+	BuiltSystem() :
+		number_of_system_caps(0),  // Initialize number of system capabilities to 0
+		invocation_data(),         // Empty vector
+		invocation_data_size(0),   // Initialize data size to 0
+		bootstrap_invocations(),   // Empty vector
+		system_invocations(),      // Empty vector
+		kernel_boot_info(),        // Assumes default constructor for BootInfo
+		reserved_region(),         // Assumes default constructor for MemoryRegion
+		fault_ep_cap_address(0),   // Initialize to 0, indicating no address
+		reply_cap_address(0),      // Initialize to 0, indicating no address
+		cap_lookup(),              // Empty unordered_map
+		tcb_caps(),                // Empty vector
+		sched_caps(),              // Empty vector
+		ntfn_caps(),               // Empty vector
+		pd_elf_regions(),          // Empty vector of vectors
+		pd_setvar_values(),        // Empty vector of vectors
+		kernel_objects(),          // Empty vector
+		initial_task_virt_region(),// Assumes default constructor for MemoryRegion
+		initial_task_phys_region() // Assumes default constructor for MemoryRegion
+	{}
+
+	static BuiltSystem build_system(
+			const Config &config,
+			const std::vector<ElfFile> &pd_elf_files,
+			const ElfFile &kernel_elf,
+			const ElfFile &monitor_elf,
+			const SystemDescription &system,
+			const uint64_t &invocation_table_size,
+			const uint64_t &system_cnode_size) {
+		assert(util::is_power_of_two(system_cnode_size));
+		assert(invocation_table_size % config.minimum_page_size == 0);
+		assert(invocation_table_size <= MAX_SYSTEM_INVOCATION_SIZE);
+
+		std::unordered_map<uint64_t, std::string> cap_address_names;
+		cap_address_names[INIT_NULL_CAP_ADDRESS] = "null";
+		cap_address_names[INIT_TCB_CAP_ADDRESS] = "TCB: init";
+		cap_address_names[INIT_CNODE_CAP_ADDRESS] = "CNode: init";
+		cap_address_names[INIT_VSPACE_CAP_ADDRESS] = "VSpace: init";
+		cap_address_names[INIT_ASID_POOL_CAP_ADDRESS] = "ASID Pool: init";
+		cap_address_names[IRQ_CONTROL_CAP_ADDRESS] = "IRQ Control";
+		cap_address_names[SMC_CAP_ADDRESS] = "SMC";
+
+		unsigned long long system_cnode_bits = util::ilog2(system_cnode_size);
+
+		// Emulate kernel boot
+
+		// Determine physical memory region used by the monitor
+		// 确定monitor使用的物理内存区域大小
+		uint64_t initial_task_size = monitor_elf.phys_mem_region_from_elf(config.minimum_page_size).size();
+
+		// Determine physical memory region for 'reserved' memory.
+		//
+		// The 'reserved' memory region will not be touched by seL4 during boot
+		// and allows the monitor (initial task) to create memory regions
+		// from this area, which can then be made available to the appropriate
+		// protection domains
+		// 确定‘保留’内存的物理内存区域大小。
+		//
+		// 在启动期间，seL4 不会触及‘保留’的内存区域
+		// 这允许监视器（初始任务）从这一区域创建内存区域，
+		// 然后可以将这些内存区域提供给适当的保护域。
+		uint64_t pd_elf_size = 0;
+		std::cout << "all pd elf files:" << std::endl;
+		for (auto &pd_elf : pd_elf_files) {
+			std::cout << pd_elf.get_elf_path().string() << std::endl;
+			auto regions = pd_elf.phys_mem_regions_from_elf(config.minimum_page_size);
+			for (const auto &region : regions) {
+				pd_elf_size += region.size();
+			}
+		}
+
+		uint64_t reserved_size = invocation_table_size + pd_elf_size;
+
+		// Now that the size is determined, find a free region in the physical memory
+		// space.
+		// 找到物理内存中空闲的区域
+		auto [available_memory, kernel_boot_region] = KernelPartialBootInfo::emulate_kernel_boot_partial(config, kernel_elf);
+
+		uint64_t reserved_base = available_memory.allocate_from(reserved_size, kernel_boot_region.end);
+		assert(kernel_boot_region.base < reserved_base);
+
+		uint64_t initial_task_phys_base = available_memory.allocate_from(initial_task_size, reserved_base + reserved_size);
+		assert(reserved_base < initial_task_phys_base);
+
+		MemoryRegion initial_task_phys_region = MemoryRegion(initial_task_phys_base, initial_task_phys_base + initial_task_size);
+		MemoryRegion initial_task_virt_region = monitor_elf.virt_mem_region_from_elf(config.minimum_page_size);
+	
+		MemoryRegion invocation_table_region = MemoryRegion(reserved_base, reserved_base + invocation_table_size);
+
+		// BootInfo kernel_boot_info = emulate_kernel_boot(
+		// 	config,
+		// 	kernel_elf,
+		// 	initial_task_phys_region,
+		// 	initial_task_virt_region,
+		// 	reserved_region,
+		// );
+
+		return {};
+	}
 };
 
 struct Args {
@@ -163,27 +481,6 @@ struct Args {
 static bool json_str_as_bool(const nlohmann::json &json, const std::string &key)
 {
 	return json.contains(key) && json[key].is_boolean() && json[key].get<bool>();
-}
-
-static uint64_t json_str_as_u64(const nlohmann::json &json, const std::string &key)
-{
-	uint64_t value;
-	try {
-		auto ws_val = json.at("WORD_SIZE");
-		if (ws_val.is_string()) {
-			// 如果是字符串，尝试转换为数字
-			value = std::stoull(ws_val.get<std::string>());
-		} else {
-			// 如果本身就是数字
-			value = ws_val.get<uint64_t>();
-		}
-	} catch (const nlohmann::json::exception &e) {
-		std::cerr << "Parsing error on 'WORD_SIZE': " << e.what() << '\n';
-		// 处理错误，比如可以设置一个默认值
-		value = -1; // 默认值
-	}
-
-	return value;
 }
 
 std::optional<std::filesystem::path> get_full_path(const std::filesystem::path &image, const std::vector<std::filesystem::path> &search_paths) {
@@ -498,13 +795,13 @@ int main(int argc, char *argv[])
 	try {
 		kernel_config = {
 			.arch = arch,
-			.word_size = json_str_as_u64(kernel_config_json, "WORD_SIZE"),
+			.word_size = util::json_str_as_u64(kernel_config_json, "WORD_SIZE"),
 			.minimum_page_size = 4096,
-			.paddr_user_device_top = json_str_as_u64(kernel_config_json, "PADDR_USER_DEVICE_TOP"),
+			.paddr_user_device_top = util::json_str_as_u64(kernel_config_json, "PADDR_USER_DEVICE_TOP"),
 			.kernel_frame_size = kernel_frame_size,
-			.init_cnode_bits = json_str_as_u64(kernel_config_json, "ROOT_CNODE_SIZE_BITS"),
+			.init_cnode_bits = util::json_str_as_u64(kernel_config_json, "ROOT_CNODE_SIZE_BITS"),
 			.cap_address_bits = 64,
-			.fan_out_limit = json_str_as_u64(kernel_config_json, "RETYPE_FAN_OUT_LIMIT"),
+			.fan_out_limit = util::json_str_as_u64(kernel_config_json, "RETYPE_FAN_OUT_LIMIT"),
 			.hypervisor = hypervisor,
 			.benchmark = args.config == "benchmark",
 			.fpu = json_str_as_bool(kernel_config_json, "HAVE_FPU"),
@@ -515,7 +812,7 @@ int main(int argc, char *argv[])
 		};
 	} catch (const std::exception &e) {
 		std::cerr << "Failed to create config: " << e.what() << std::endl;
-        std::exit(1);
+		std::exit(1);
 	}
 
 	try {
@@ -548,6 +845,8 @@ int main(int argc, char *argv[])
 	ElfFile kernel_elf(kernel_elf_path);
         ElfFile monitor_elf(monitor_elf_path);
 
+	std::cout << "monitor_elf_path = " << monitor_elf_path << std::endl;
+
 	size_t loadable_segments_count = monitor_elf.count_loadable_segments();
         if (loadable_segments_count > 1) {
             std::cerr << "Monitor (" << monitor_elf_path << ") has " << loadable_segments_count
@@ -575,7 +874,7 @@ int main(int argc, char *argv[])
 		std::exit(1);
 	}
 
-	std::vector<ElfFile> pd_elf_files(system.protection_domains.size());
+	std::vector<ElfFile> pd_elf_files;
 	for (auto pd : system.protection_domains) {
 		auto optional_path = get_full_path(pd.get_program_image(), search_paths);
 		if (optional_path) {
@@ -588,6 +887,16 @@ int main(int argc, char *argv[])
 
 	uint64_t invocation_table_size = kernel_config.minimum_page_size;
 	uint64_t system_cnode_size = 2;
+
+	BuiltSystem built_system = BuiltSystem::build_system(
+		kernel_config,
+		pd_elf_files,
+		kernel_elf,
+		monitor_elf,
+		system,
+		invocation_table_size,
+		system_cnode_size
+	);
 
 	return 0;
 }
