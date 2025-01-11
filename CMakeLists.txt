@@ -19,8 +19,27 @@ add_subdirectory(third_party/ELFIO-Release_3.12)
 # find_package(PkgConfig)
 # pkg_check_modules(LIBELF REQUIRED libelf)
 
+add_library(lib SHARED
+	util.cpp
+	sel4.cpp
+)
+
+# 指定库的公开头文件
+target_include_directories(lib PUBLIC
+	include
+)
+
 add_executable(microkit main.cpp)
+
+target_link_libraries(lib PRIVATE
+	nlohmann_json::nlohmann_json
+	tinyxml2 elfio::elfio
+)
 
 # 链接 nlohmann/json 库
 # target_link_libraries(microkit PRIVATE nlohmann_json::nlohmann_json tinyxml2 ${LIBELF_LIBRARIES} elfio::elfio)
-target_link_libraries(microkit PRIVATE nlohmann_json::nlohmann_json tinyxml2 elfio::elfio)
+target_link_libraries(microkit PRIVATE
+	nlohmann_json::nlohmann_json
+	tinyxml2 elfio::elfio
+	lib
+)

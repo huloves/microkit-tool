@@ -35,7 +35,7 @@ private:
 public:
 	ElfFile() {}
 
-	ELFIO::elfio *get_elf(void) { return elf; };
+	ELFIO::elfio *get_elf(void) const { return elf; };
 	std::filesystem::path get_elf_path(void) const { return elfPath; }
 
 	explicit ElfFile(const std::filesystem::path &elf_path) : elfPath(elf_path) {

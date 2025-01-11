@@ -15,6 +15,9 @@
 #include "nlohmann/json.hpp"
 #include "tinyxml2.h"
 
+constexpr uint64_t SLOT_BITS = 5;
+constexpr uint64_t SLOT_SIZE = 1 << SLOT_BITS;
+
 constexpr uint64_t INIT_NULL_CAP_ADDRESS       = 0;
 constexpr uint64_t INIT_TCB_CAP_ADDRESS        = 1;
 constexpr uint64_t INIT_CNODE_CAP_ADDRESS      = 2;
@@ -270,6 +273,170 @@ public:
 		initial_task_phys_region() // Assumes default constructor for MemoryRegion
 	{}
 
+	static uint64_t get_n_paging(const MemoryRegion& region, uint64_t bits) {
+		uint64_t start = util::round_down(region.base, 1ULL << bits);
+		uint64_t end = util::round_up(region.end, 1ULL << bits);
+
+		return (end - start) >> bits;
+	}
+
+	static uint64_t get_arch_n_paging(const Config& config, const MemoryRegion& region) {
+		if (config.arch == Arch::Aarch64) {
+			constexpr uint64_t PT_INDEX_OFFSET = 12;
+			constexpr uint64_t PD_INDEX_OFFSET = PT_INDEX_OFFSET + 9;
+			constexpr uint64_t PUD_INDEX_OFFSET = PD_INDEX_OFFSET + 9;
+
+			return get_n_paging(region, PUD_INDEX_OFFSET) + get_n_paging(region, PD_INDEX_OFFSET);
+		} else if (config.arch == Arch::Riscv64 && config.riscv_pt_levels.has_value()) {
+			switch(config.riscv_pt_levels.value()) {
+			case RiscvVirtualMemory::Sv39: {
+				constexpr uint64_t PT_INDEX_OFFSET = 12;
+				constexpr uint64_t LVL1_INDEX_OFFSET = PT_INDEX_OFFSET + 9;
+				constexpr uint64_t LVL2_INDEX_OFFSET = LVL1_INDEX_OFFSET + 9;
+
+				return get_n_paging(region, LVL2_INDEX_OFFSET) + get_n_paging(region, LVL1_INDEX_OFFSET);
+			}
+			default:
+				throw std::runtime_error("Unsupported RISC-V paging level");
+			}
+		} else {
+			throw std::runtime_error("Unsupported architecture");
+		}
+
+		return 0; // To silence compiler warning, this part is theoretically unreachable.
+	}
+
+	static uint64_t rootserver_max_size_bits(const Config& config) {
+		const uint64_t slot_bits = 5; // Assuming seL4_SlotBits is constant across uses
+		const uint64_t root_cnode_bits = config.init_cnode_bits; // CONFIG_ROOT_CNODE_SIZE_BITS
+		const uint64_t vspace_bits = config.fixed_size_bits(ObjectType::VSpace).value();
+
+		const uint64_t cnode_size_bits = root_cnode_bits + slot_bits;
+		return std::max(cnode_size_bits, vspace_bits);
+	}
+
+	static uint64_t calculate_rootserver_size(const Config& config, const MemoryRegion& initial_task_region) {
+		// FIXME: These constants should ideally come from the config / kernel
+		// binary not be hard coded here.
+		// But they are constant so it isn't too bad.
+		const uint64_t slot_bits = 5;  // seL4_SlotBits 5 32B
+		const uint64_t root_cnode_bits = config.init_cnode_bits;  // CONFIG_ROOT_CNODE_SIZE_BITS 12 4k
+		const uint64_t tcb_bits = config.fixed_size_bits(ObjectType::Tcb).value();  // seL4_TCBBits 11 2k
+		const uint64_t page_bits = config.fixed_size_bits(ObjectType::SmallPage).value();  // seL4_PageBits 12 4k
+		const uint64_t asid_pool_bits = 12;  // seL4_ASIDPoolBits 12
+		const uint64_t vspace_bits = config.fixed_size_bits(ObjectType::VSpace).value();  // seL4_VSpaceBits 13 8k
+		const uint64_t page_table_bits = config.fixed_size_bits(ObjectType::PageTable).value();  // seL4_PageTableBits 12 4k
+		const uint64_t min_sched_context_bits = 7;  // seL4_MinSchedContextBits 7 128B
+
+		uint64_t size = 0;
+		size += 1ULL << (root_cnode_bits + slot_bits);
+		size += 1ULL << tcb_bits;
+		size += 2 * (1ULL << page_bits);
+		size += 1ULL << asid_pool_bits;
+		size += 1ULL << vspace_bits;
+		size += get_arch_n_paging(config, initial_task_region) * (1ULL << page_table_bits);
+		size += 1ULL << min_sched_context_bits;
+
+		return size;
+	}
+
+	static BootInfo emulate_kernel_boot(
+				const Config &config,
+				const ElfFile kernel_elf,
+				const MemoryRegion initial_task_phys_region,
+				const MemoryRegion initial_task_virt_region,
+				MemoryRegion reserved_region) {
+		assert(initial_task_phys_region.size() == initial_task_virt_region.size());
+		KernelPartialBootInfo partial_info = KernelPartialBootInfo::kernel_partial_boot(config, kernel_elf);
+		DisjointMemoryRegion normal_memory = partial_info.normal_memory;
+		DisjointMemoryRegion device_memory = partial_info.device_memory;
+		MemoryRegion boot_region = partial_info.boot_region;
+
+		normal_memory.remove_region(initial_task_phys_region.base, initial_task_phys_region.end);
+		normal_memory.remove_region(reserved_region.base, reserved_region.end);
+
+		uint64_t initial_objects_size = calculate_rootserver_size(config, initial_task_virt_region);
+		uint64_t initial_objects_align = rootserver_max_size_bits(config);
+
+		// Find an appropriate region of normal memory to allocate the objects
+		// from; this follows the same algorithm used within the kernel boot code
+		// (or at least we hope it does!)
+		// TOOD: this loop could be done better in a functional way?
+		// 找到一个适当的普通内存区域来分配对象
+		// 这遵循内核启动代码中使用的相同算法
+		// （或者至少我们希望如此！）
+		std::optional<uint64_t> region_to_remove = normal_memory.get_base_from_end(initial_objects_size, initial_objects_align);
+		if (region_to_remove.has_value()) {
+			uint64_t start = region_to_remove.value();
+			normal_memory.remove_region(start, start + initial_objects_size);
+		} else {
+			throw std::runtime_error("Couldn't find appropriate region for initial task kernel objects");
+		}
+
+		const uint64_t fixed_cap_count = 0x10; // 16 in hexadecimal
+		const uint64_t sched_control_cap_count = 1;
+
+		uint64_t paging_cap_count = get_arch_n_paging(config, initial_task_virt_region);
+		uint64_t page_cap_count = initial_task_virt_region.size() / config.minimum_page_size;
+		uint64_t first_untyped_cap = fixed_cap_count + paging_cap_count + sched_control_cap_count + page_cap_count;
+		uint64_t sched_control_cap = fixed_cap_count + paging_cap_count;
+
+		std::cout << "fixed_cap_count = " << std::hex << fixed_cap_count << std::endl;
+		std::cout << "first_untyped_cap = " << std::hex << first_untyped_cap << std::endl;
+
+		uint64_t max_bits;
+		switch (config.arch) {
+		case Arch::Aarch64:
+			max_bits = 47;
+			break;
+		case Arch::Riscv64:
+			max_bits = 38;
+			break;
+			// Include other cases as necessary
+		default:
+			throw std::runtime_error("Unsupported architecture.");
+		}
+
+		// Device regions concatenation
+		std::vector<MemoryRegion> device_regions;
+		std::vector<MemoryRegion> temp1 = reserved_region.aligned_power_of_two_regions(max_bits);
+		std::vector<MemoryRegion> temp2 = device_memory.aligned_power_of_two_regions(max_bits);
+		device_regions.insert(device_regions.end(), temp1.begin(), temp1.end());
+		device_regions.insert(device_regions.end(), temp2.begin(), temp2.end());
+
+		// Normal regions concatenation
+		std::vector<MemoryRegion> normal_regions;
+		temp1 = boot_region.aligned_power_of_two_regions(max_bits);
+		temp2 = normal_memory.aligned_power_of_two_regions(max_bits);
+		normal_regions.insert(normal_regions.end(), temp1.begin(), temp1.end());
+		normal_regions.insert(normal_regions.end(), temp2.begin(), temp2.end());
+
+		std::vector<UntypedObject> untyped_objects;
+
+		uint64_t cap;
+		for (size_t i = 0; i < device_regions.size(); ++i) {
+			cap = i + first_untyped_cap;
+			untyped_objects.push_back(UntypedObject(cap, device_regions[i], true));
+		}
+
+		uint64_t normal_regions_start_cap = first_untyped_cap + device_regions.size();
+		for (size_t i = 0; i < normal_regions.size(); ++i) {
+			cap = i + normal_regions_start_cap;
+			untyped_objects.push_back(UntypedObject(cap, normal_regions[i], false));
+		}
+
+		uint64_t first_available_cap = normal_regions_start_cap + normal_regions.size();
+
+		return BootInfo {
+			.fixed_cap_count = fixed_cap_count,
+			.sched_control_cap = sched_control_cap,
+			.paging_cap_count = paging_cap_count,
+			.page_cap_count = page_cap_count,
+			.untyped_objects = untyped_objects,
+			.first_available_cap = first_available_cap,
+		};
+	}
+
 	static BuiltSystem build_system(
 			const Config &config,
 			const std::vector<ElfFile> &pd_elf_files,
@@ -330,21 +497,271 @@ public:
 		uint64_t reserved_base = available_memory.allocate_from(reserved_size, kernel_boot_region.end);
 		assert(kernel_boot_region.base < reserved_base);
 
+		std::cout << "reserved_base = " << std::hex << reserved_base << std::endl;
+
 		uint64_t initial_task_phys_base = available_memory.allocate_from(initial_task_size, reserved_base + reserved_size);
 		assert(reserved_base < initial_task_phys_base);
 
+		std::cout << "initial_task_phys_base = " << std::hex << initial_task_phys_base << std::endl;
+
 		MemoryRegion initial_task_phys_region = MemoryRegion(initial_task_phys_base, initial_task_phys_base + initial_task_size);
 		MemoryRegion initial_task_virt_region = monitor_elf.virt_mem_region_from_elf(config.minimum_page_size);
+
+		MemoryRegion reserved_region = MemoryRegion(reserved_base, reserved_base + reserved_size);
 	
 		MemoryRegion invocation_table_region = MemoryRegion(reserved_base, reserved_base + invocation_table_size);
 
-		// BootInfo kernel_boot_info = emulate_kernel_boot(
-		// 	config,
-		// 	kernel_elf,
-		// 	initial_task_phys_region,
-		// 	initial_task_virt_region,
-		// 	reserved_region,
-		// );
+		BootInfo kernel_boot_info = emulate_kernel_boot(
+			config,
+			kernel_elf,
+			initial_task_phys_region,
+			initial_task_virt_region,
+			reserved_region
+		);
+
+		for (const auto& ut : kernel_boot_info.untyped_objects) {
+			std::ostringstream oss;
+			std::string dev_str = ut.is_device ? " (device)" : "";
+			oss << "Untyped @ 0x" << std::hex << ut.region.base << ":0x" << ut.region.size() << dev_str;
+			cap_address_names[ut.cap] = oss.str();
+		}
+
+		// The kernel boot info allows us to create an allocator for kernel objects
+		ObjectAllocator kao(kernel_boot_info);
+
+		// 2. Now that the available resources are known it is possible to proceed with the
+		// monitor task boot strap.
+		//
+		// The boot strap of the monitor works in two phases:
+		//
+		//   1. Setting up the monitor's CSpace
+		//   2. Making the system invocation table available in the monitor's address
+		//   space.
+
+		// 2.1 The monitor's CSpace consists of two CNodes: a/ the initial task CNode
+		// which consists of all the fixed initial caps along with caps for the
+		// object create during kernel bootstrap, and b/ the system CNode, which
+		// contains caps to all objects that will be created in this process.
+		// The system CNode is of `system_cnode_size`. (Note: see also description
+		// on how `system_cnode_size` is iteratively determined).
+		// 2.1 监控器的 CSpace （能力空间）包含两个 CNode（能力节点）：a/ 初始任务 CNode，
+		// 它包括所有固定的初始能力以及在内核引导时创建的对象的能力；b/ 系统 CNode，其中
+		// 包含本进程将创建的所有对象的能力。
+		// 系统 CNode 的大小为 system_cnode_size。（注：另见关于如何迭代确定 system_cnode_size 的描述）。
+		//
+		// The system CNode is not available at startup and must be created (by retyping
+		// memory from an untyped object). Once created the two CNodes must be aranged
+		// as a tree such that the slots in both CNodes are addressable.
+		// system CNode 在启动时不可用，必须通过retype未类型化对象的内存来创建。
+		// 一旦创建，两个 CNode 必须以树的形式组织，以便两个 CNode 中的槽位都可以寻址。
+		//
+		// The system CNode shall become the root of the CSpace. The initial CNode shall
+		// be copied to slot zero of the system CNode. In this manner all caps in the initial
+		// CNode will keep their original cap addresses. This isn't required but it makes
+		// allocation, debugging and reasoning about the system more straight forward.
+		// system CNode 应成为 CSpace 的根节点。初始 CNode 应被复制到system CNode 的第零槽位。
+		// 通过这种方式，初始 CNode 中的所有能力（caps）将保持它们原始的能力地址。
+		// 这不是必需的，但这样做使得系统的分配、调试和逻辑推理更为直接。
+		//
+		// The guard shall be selected so the least significant bits are used. The guard
+		// for the root shall be:
+		// 应选择护卫以便使用最低有效位。根的护卫应为：
+		//
+		//   64 - system cnode bits - initial cnode bits
+		//
+		// The guard for the initial CNode will be zero.
+		//
+		// 2.1.1: Allocate the *root* CNode. It is two entries:
+		//  slot 0: the existing init cnode
+		//  slot 1: our main system cnode
+		int root_cnode_bits = 1;
+		KernelAllocation root_cnode_allocation = kao.alloc((1 << root_cnode_bits) * (1 << SLOT_BITS));
+		uint64_t root_cnode_cap = kernel_boot_info.first_available_cap;
+		cap_address_names[root_cnode_cap] = "CNode: root";
+
+		// 2.1.2: Allocate the *system* CNode. It is the cnodes that
+		// will have enough slots for all required caps.
+		KernelAllocation system_cnode_allocation = kao.alloc(system_cnode_size * (1 << SLOT_BITS));
+		uint64_t system_cnode_cap = kernel_boot_info.first_available_cap + 1;
+		cap_address_names[system_cnode_cap] = "CNode: system";
+
+		// 2.1.3: Now that we've allocated the space for these we generate
+		// the actual systems calls.
+		// 2.1.3：现在我们已经为这些系统分配了空间，接下来生成实际的系统调用。
+		//
+		// First up create the root cnode
+		std::vector<Invocation> bootstrap_invocations;
+
+		std::unique_ptr<InvocationArgs> args_ptr;
+
+		args_ptr = std::make_unique<UntypedRetypeArgs>(UntypedRetypeArgs(
+				root_cnode_allocation.untyped_cap_address,  // the untyped capability to retype
+				ObjectType::CNode,  // type
+				root_cnode_bits,  //size
+				INIT_CNODE_CAP_ADDRESS,  // root
+				0,  // node_index
+				0,  // node_depth
+				root_cnode_cap,  // node_offset
+				1));  // num_caps
+		bootstrap_invocations.push_back(Invocation(config, std::move(args_ptr)));
+
+		// 2.1.4: Now insert a cap to the initial Cnode into slot zero of the newly
+		// allocated root Cnode. It uses sufficient guard bits to ensure it is
+		// completed padded to word size
+		// 2.1.4: 现在将初始Cnode的cap插入到新分配的根Cnode的零号槽中。
+		// 它使用足够的保护位来确保其填充到字大小。
+		//
+		// guard size is the lower bit of the guard, upper bits are the guard itself
+		// which for out purposes is always zero.
+		// 保护大小是保护位的低位，高位是保护位本身，对于我们的目的来说，它始终为零。
+		uint64_t guard = config.cap_address_bits - root_cnode_bits - config.init_cnode_bits;
+		args_ptr = std::make_unique<CnodeMint>(CnodeMint(
+				root_cnode_cap,
+				0,
+				root_cnode_bits,
+				INIT_CNODE_CAP_ADDRESS,
+				INIT_CNODE_CAP_ADDRESS,
+				config.cap_address_bits,
+				static_cast<uint64_t>(Right::All),
+				guard));
+		bootstrap_invocations.push_back(Invocation(config, std::move(args_ptr)));
+
+		// 2.1.5: Now it is possible to switch our root Cnode to the newly create
+		// root cnode. We have a zero sized guard. This Cnode represents the top
+		// bit of any cap addresses.
+		// 2.1.5: 现在我们可以将我们的根 Cnode 切换到新创建的根 cnode。
+		// 我们有一个大小为零的保护。这个 Cnode 代表任何能力地址的最高位。
+		uint64_t root_guard = 0;
+		args_ptr = std::make_unique<TcbSetSpace>(TcbSetSpace(
+				INIT_TCB_CAP_ADDRESS,
+				INIT_NULL_CAP_ADDRESS,
+				root_cnode_cap,
+				root_guard,
+				INIT_VSPACE_CAP_ADDRESS,
+				0));
+		bootstrap_invocations.push_back(Invocation(config, std::move(args_ptr)));
+
+		// 2.1.6: Now we can create our new system Cnode. We will place it into
+    		// a temporary cap slot in the initial CNode to start with.
+		args_ptr = std::make_unique<UntypedRetypeArgs>(UntypedRetypeArgs(
+				system_cnode_allocation.untyped_cap_address,
+				ObjectType::CNode,
+				system_cnode_bits,
+				INIT_CNODE_CAP_ADDRESS,
+				0,
+				0,
+				system_cnode_cap,
+				1));
+		bootstrap_invocations.push_back(Invocation(config, std::move(args_ptr)));
+
+		// 2.1.7: Now that the we have create the object, we can 'mutate' it
+		// to the correct place:
+		// Slot #1 of the new root cnode
+		uint64_t system_cap_address_mask = 1 << (config.cap_address_bits - 1);
+		args_ptr = std::make_unique<CnodeMint>(CnodeMint(
+				root_cnode_cap,
+				1,
+				root_cnode_bits,
+				INIT_CNODE_CAP_ADDRESS,
+				system_cnode_cap,
+				config.cap_address_bits,
+				static_cast<uint64_t>(Right::All),
+				config.cap_address_bits - root_cnode_bits - system_cnode_bits));
+		bootstrap_invocations.push_back(Invocation(config, std::move(args_ptr)));
+
+		// 2.2 At this point it is necessary to get the frames containing the
+		// main system invocations into the virtual address space. (Remember the
+		// invocations we are writing out here actually _execute_ at run time!
+		// It is a bit weird that we talk about mapping in the invocation data
+		// before we have even generated the invocation data!).
+		// 2.2 此时，有必要将包含主系统调用的帧获取到虚拟地址空间中。
+		// （请记住，我们在这里写出的调用实际上是在运行时执行的！
+		// 在我们甚至还没有生成调用数据之前，我们讨论映射调用数据确实有点奇怪！）。
+		//
+		// This needs a few steps:
+		//
+		// 1. Turn untyped into page objects
+		// 2. Map the page objects into the address space
+		// 这需要几个步骤：
+		//
+		// 1. 将无类型数据转换为页面对象
+		// 2. 将页面对象映射到地址空间中
+		//
+
+		// 2.2.1: The memory for the system invocation data resides at the start
+		// of the reserved region. We can retype multiple frames as a time (
+		// which reduces the number of invocations we need). However, it is possible
+		// that the region spans multiple untyped objects.
+		// At this point in time we assume we will map the area using the minimum
+		// page size. It would be good in the future to use super pages (when
+		// it makes sense to - this would reduce memory usage, and the number of
+		// invocations required to set up the address space
+		// 2.2.1：系统调用数据的内存位于保留区域的起始处。
+		// 我们可以一次重新类型化多个帧（这样可以减少我们需要的调用次数）。然而，这个区域可能跨越多个无类型对象。
+		// 此时，我们假设我们将使用最小页面大小来映射该区域。
+		// 将来使用超级页面（只有在合适的时候 - 这将减少内存使用和建立地址空间所需的调用次数）会是一个不错的选择。
+		uint64_t pages_required = invocation_table_size / config.minimum_page_size;
+		uint64_t base_page_cap = 0;
+		for (uint64_t pta = base_page_cap; pta < base_page_cap + pages_required; ++pta) {
+			int cap_address = system_cap_address_mask | pta;
+			cap_address_names[cap_address] = "SmallPage: monitor invocation table";
+		}
+
+		uint64_t remaining_pages = pages_required;
+		std::vector<std::pair<UntypedObject*, uint64_t>> invocation_table_allocations;
+		uint64_t cap_slot = base_page_cap;
+		uint64_t phys_addr = invocation_table_region.base;
+
+		std::cout << "phys_addr = " << phys_addr << std::endl;
+
+		std::vector<UntypedObject*> boot_info_device_untypeds;
+		for (auto& obj : kernel_boot_info.untyped_objects) {
+			if (obj.is_device) {
+				boot_info_device_untypeds.push_back(&obj);
+			}
+		}
+
+		for (const auto& ut : boot_info_device_untypeds) {
+			size_t ut_pages = ut->getRegion().size() / config.minimum_page_size;
+			size_t retype_page_count = std::min(ut_pages, remaining_pages);
+
+			std::cout << "ut_pages = " << ut_pages << std::endl;
+			std::cout << "remaining_pages = " << remaining_pages << std::endl;
+			size_t retypes_remaining = retype_page_count;
+			while (retypes_remaining > 0) {
+				size_t num_retypes = std::min(retypes_remaining, config.fan_out_limit);
+				args_ptr = std::make_unique<UntypedRetypeArgs>(UntypedRetypeArgs(
+						ut->cap,
+						ObjectType::SmallPage,
+						0,
+						root_cnode_cap,
+						1,
+						1,
+						cap_slot,
+						num_retypes));
+				bootstrap_invocations.push_back(Invocation(config, std::move(args_ptr)));
+				
+				retypes_remaining -= num_retypes;
+				cap_slot += num_retypes;
+			}
+
+			remaining_pages -= retype_page_count;
+			phys_addr += retype_page_count * config.minimum_page_size;
+			std::cout << "phys_addr = " << phys_addr << std::endl;
+			invocation_table_allocations.push_back(std::pair<UntypedObject*, uint64_t>(ut, phys_addr));
+			if (remaining_pages == 0) {
+				break;
+			}
+		}
+
+		// 2.2.1: Now that physical pages have been allocated it is possible to setup
+		// the virtual memory objects so that the pages can be mapped into virtual memory
+		// At this point we map into the arbitrary address of 0x0.8000.0000 (i.e.: 2GiB)
+		// We arbitrary limit the maximum size to be 128MiB. This allows for at least 1 million
+		// invocations to occur at system startup. This should be enough for any reasonable
+		// sized system.
+		//
+		// Before mapping it is necessary to install page tables that can cover the region.
 
 		return {};
 	}
